@@ -38,7 +38,6 @@ const InlineSourceOptionsSchema = z
 		cssoOptions: z.object({}).passthrough().default({}),
 		terserOptions: z.object({}).passthrough().default({}),
 	})
-	.default({});
 
 type InlineSourceOptions = z.input<typeof InlineSourceOptionsSchema>;
 
