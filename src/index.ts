@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { minify as minifyCss } from "csso";
-import type { TransformPluginContext } from "rollup";
 import * as sass from "sass";
 import { optimize as optimizeSvg } from "svgo";
 import { minify as minifyJs } from "terser";
@@ -41,6 +40,14 @@ const InlineSourceOptionsSchema = z
 	.default({});
 
 type InlineSourceOptions = z.input<typeof InlineSourceOptionsSchema>;
+type TransformHtmlContext =
+	| IndexHtmlTransformContext
+	| {
+			load(options: { id: string }): Promise<unknown>;
+	  };
+type RawAstLoadResult = {
+	code?: unknown;
+};
 
 const PATTERN =
 	/<([A-z0-9-]+)\s+([^>]*?)src\s*=\s*"([^>]*?)"([^>]*?)\s*((\/>)|(>\s*<\/\s*\1\s*>))/gi;
@@ -51,10 +58,70 @@ export default function VitePluginInlineSource(
 	const options = InlineSourceOptionsSchema.parse(opts);
 	let root = "";
 
-	async function transformHtml(
-		source: string,
-		ctx: TransformPluginContext | IndexHtmlTransformContext,
-	) {
+	function extractRawStringFromCode(code: string): string | null {
+		const exportMatch = code.trim().match(/^export\s+default\s+([\s\S]+?);?$/);
+		if (!exportMatch) {
+			return null;
+		}
+
+		const expression = exportMatch[1]?.trim();
+		if (!expression) {
+			return null;
+		}
+
+		if (expression[0] !== '"') {
+			return null;
+		}
+
+		try {
+			const parsed = JSON.parse(expression);
+			return typeof parsed === "string" ? parsed : null;
+		} catch {
+			return null;
+		}
+	}
+
+	async function loadRawFileContent(
+		filePath: string,
+		ctx: TransformHtmlContext,
+	): Promise<string> {
+		if ("server" in ctx && ctx.server) {
+			return (await readFile(filePath)).toString();
+		}
+
+		let fileSystemReadError: unknown;
+		try {
+			return (await readFile(filePath)).toString();
+		} catch (error) {
+			fileSystemReadError = error;
+		}
+
+		if (!("load" in ctx) || typeof ctx.load !== "function") {
+			throw new Error(
+				`Failed to load file: ${filePath}. ${String(fileSystemReadError)}`,
+			);
+		}
+
+		const loaded = await ctx.load({ id: `${filePath}?raw` });
+		if (typeof loaded === "string") {
+			return loaded;
+		}
+
+		const astLoaded = loaded as RawAstLoadResult | null;
+		if (typeof astLoaded?.code === "string") {
+			const extractedRaw = extractRawStringFromCode(astLoaded.code);
+			if (typeof extractedRaw === "string") {
+				return extractedRaw;
+			}
+			return astLoaded.code;
+		}
+
+		throw new Error(
+			`Failed to load file: ${filePath}. ${String(fileSystemReadError)}`,
+		);
+	}
+
+	async function transformHtml(source: string, ctx: TransformHtmlContext) {
 		const result = [];
 		const tokens = source.matchAll(PATTERN);
 		let prevPos = 0;
@@ -76,11 +143,7 @@ export default function VitePluginInlineSource(
 
 			const filePath = root ? path.join(root, fileName) : fileName;
 
-			let fileContent: string = (ctx as IndexHtmlTransformContext).server
-				? (await readFile(`${filePath}`)).toString()
-				: // @ts-expect-error don't know these types aren't right
-					(await ctx.load({ id: `${filePath}?raw` })).ast?.body?.[0].declaration
-						.value;
+			let fileContent = await loadRawFileContent(filePath, ctx);
 			if (isSvgFile && options.optimizeSvgs) {
 				fileContent = optimizeSvg(fileContent, options.svgoOptions).data;
 			} else if (isCssFile && options.optimizeCss) {
